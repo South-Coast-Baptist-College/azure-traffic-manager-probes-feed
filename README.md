@@ -57,7 +57,7 @@ For a normal IPv4 firewall policy, use the IPv4-only feed:
 
 ```shell
 config system external-resource
-    edit "resourse-ext-AzureTrafficManager_Probes_IPv4"
+    edit "res-ext-ATM_Probes_IPv4"
         set status enable
         set type address
         set resource "https://<github-pages-url>/feeds/azure-traffic-manager-probes-ipv4.txt"
