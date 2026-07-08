@@ -1,0 +1,183 @@
+name: Check Azure Traffic Manager probe feeds
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 9 * * *'
+      timezone: 'Australia/Perth'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-azure-traffic-manager-probe-feeds
+  cancel-in-progress: true
+
+jobs:
+  check-feeds:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate feed files from public Microsoft Service Tags JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p generated-feeds
+
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import sys
+          import urllib.request
+          import ipaddress
+
+          confirmation_url = "https://www.microsoft.com/en-us/download/confirmation.aspx?id=56519"
+          service_tag_name = "AzureTrafficManager"
+
+          output_all = Path("generated-feeds/azure-traffic-manager-probes.txt")
+          output_ipv4 = Path("generated-feeds/azure-traffic-manager-probes-ipv4.txt")
+          output_ipv6 = Path("generated-feeds/azure-traffic-manager-probes-ipv6.txt")
+
+          print(f"Downloading Microsoft confirmation page: {confirmation_url}")
+
+          with urllib.request.urlopen(confirmation_url, timeout=60) as response:
+              html = response.read().decode("utf-8", errors="replace")
+
+          matches = re.findall(
+              r'https://download\.microsoft\.com/download/[^"\']+/ServiceTags_Public_[0-9]+\.json',
+              html,
+          )
+
+          if not matches:
+              print("ERROR: Could not find ServiceTags_Public_*.json URL on Microsoft page")
+              sys.exit(1)
+
+          json_url = matches[0]
+          print(f"Downloading Service Tags JSON: {json_url}")
+
+          with urllib.request.urlopen(json_url, timeout=120) as response:
+              data = json.loads(response.read().decode("utf-8"))
+
+          print(f"Service Tags changeNumber: {data.get('changeNumber')}")
+          print(f"Service Tags cloud: {data.get('cloud')}")
+          print(f"Looking for service tag: {service_tag_name}")
+
+          service_tag = None
+          for value in data.get("values", []):
+              if value.get("name") == service_tag_name:
+                  service_tag = value
+                  break
+
+          if service_tag is None:
+              print(f"ERROR: Service tag not found: {service_tag_name}")
+              sys.exit(1)
+
+          prefixes = service_tag["properties"]["addressPrefixes"]
+
+          ipv4 = []
+          ipv6 = []
+
+          for prefix in prefixes:
+              try:
+                  network = ipaddress.ip_network(prefix, strict=False)
+              except ValueError as exc:
+                  print(f"ERROR: Invalid CIDR prefix {prefix!r}: {exc}")
+                  sys.exit(1)
+
+              if network.version == 4:
+                  ipv4.append(prefix)
+              elif network.version == 6:
+                  ipv6.append(prefix)
+              else:
+                  print(f"ERROR: Unknown IP version for prefix {prefix!r}")
+                  sys.exit(1)
+
+          output_all.write_text("\n".join(prefixes) + "\n", encoding="ascii")
+          output_ipv4.write_text("\n".join(ipv4) + ("\n" if ipv4 else ""), encoding="ascii")
+          output_ipv6.write_text("\n".join(ipv6) + ("\n" if ipv6 else ""), encoding="ascii")
+
+          print("Generated files:")
+          print(f"  {output_all}: {len(prefixes)} lines")
+          print(f"  {output_ipv4}: {len(ipv4)} lines")
+          print(f"  {output_ipv6}: {len(ipv6)} lines")
+          PY
+
+      - name: Show generated feed contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in \
+            generated-feeds/azure-traffic-manager-probes.txt \
+            generated-feeds/azure-traffic-manager-probes-ipv4.txt \
+            generated-feeds/azure-traffic-manager-probes-ipv6.txt
+          do
+            echo "::group::$file"
+            cat "$file"
+            echo "::endgroup::"
+          done
+
+      - name: Compare generated feeds with repository feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          diff_found=0
+
+          compare_file() {
+            local repo_file="$1"
+            local generated_file="$2"
+
+            echo "::group::Diff for $repo_file"
+
+            if diff -u \
+              --label "repository/$repo_file" \
+              --label "generated/$repo_file" \
+              "$repo_file" \
+              "$generated_file"
+            then
+              echo "No differences found for $repo_file"
+            else
+              echo "Differences found for $repo_file"
+              diff_found=1
+            fi
+
+            echo "::endgroup::"
+          }
+
+          compare_file \
+            "feeds/azure-traffic-manager-probes.txt" \
+            "generated-feeds/azure-traffic-manager-probes.txt"
+
+          compare_file \
+            "feeds/azure-traffic-manager-probes-ipv4.txt" \
+            "generated-feeds/azure-traffic-manager-probes-ipv4.txt"
+
+          compare_file \
+            "feeds/azure-traffic-manager-probes-ipv6.txt" \
+            "generated-feeds/azure-traffic-manager-probes-ipv6.txt"
+
+          {
+            echo "## Azure Traffic Manager probe feed check"
+            echo
+            if [ "$diff_found" -eq 1 ]; then
+              echo "Differences were found between generated feeds and repository feeds."
+              echo
+              echo "Review the workflow log diff output."
+            else
+              echo "No differences were found."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$diff_found" -eq 1 ]; then
+            echo "Differences were found, but this diagnostic workflow does not fail yet."
+          else
+            echo "Generated feeds match repository feeds."
+          fi
+
+          exit 0
