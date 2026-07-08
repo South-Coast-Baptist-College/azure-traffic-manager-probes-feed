@@ -57,7 +57,12 @@ jobs:
               print("ERROR: Could not find ServiceTags_Public_*.json URL on Microsoft page")
               sys.exit(1)
 
-          json_url = matches[0]
+          def extract_version(url: str) -> int:
+              match = re.search(r"ServiceTags_Public_([0-9]+)\.json", url)
+              return int(match.group(1)) if match else 0
+
+          json_url = sorted(set(matches), key=extract_version, reverse=True)[0]
+
           print(f"Downloading Service Tags JSON: {json_url}")
 
           with urllib.request.urlopen(json_url, timeout=120) as response:
@@ -68,6 +73,7 @@ jobs:
           print(f"Looking for service tag: {service_tag_name}")
 
           service_tag = None
+
           for value in data.get("values", []):
               if value.get("name") == service_tag_name:
                   service_tag = value
@@ -123,11 +129,14 @@ jobs:
           done
 
       - name: Compare generated feeds with repository feeds
+        id: compare
         shell: bash
         run: |
           set -euo pipefail
 
           diff_found=0
+          changed_files=()
+          : > diff-output.txt
 
           compare_file() {
             local repo_file="$1"
@@ -139,14 +148,22 @@ jobs:
               --label "repository/$repo_file" \
               --label "generated/$repo_file" \
               "$repo_file" \
-              "$generated_file"
+              "$generated_file" | tee diff-current.txt
             then
               echo "No differences found for $repo_file"
             else
               echo "Differences found for $repo_file"
               diff_found=1
+              changed_files+=("$repo_file")
+
+              {
+                echo
+                echo "### $repo_file"
+                cat diff-current.txt
+              } >> diff-output.txt
             fi
 
+            rm -f diff-current.txt
             echo "::endgroup::"
           }
 
@@ -162,11 +179,23 @@ jobs:
             "feeds/azure-traffic-manager-probes-ipv6.txt" \
             "generated-feeds/azure-traffic-manager-probes-ipv6.txt"
 
+          if [ "$diff_found" -eq 1 ]; then
+            printf -v changed_files_text '%s, ' "${changed_files[@]}"
+            changed_files_text="${changed_files_text%, }"
+          else
+            changed_files_text="None"
+          fi
+
+          echo "diff_found=$diff_found" >> "$GITHUB_OUTPUT"
+          echo "changed_files=$changed_files_text" >> "$GITHUB_OUTPUT"
+
           {
             echo "## Azure Traffic Manager probe feed check"
             echo
             if [ "$diff_found" -eq 1 ]; then
               echo "Differences were found between generated feeds and repository feeds."
+              echo
+              echo "**Changed files:** $changed_files_text"
               echo
               echo "Review the workflow log diff output."
             else
@@ -181,3 +210,133 @@ jobs:
           fi
 
           exit 0
+
+      - name: Send Teams webhook notification
+        if: always()
+        shell: bash
+        env:
+          DIFF_FOUND: ${{ steps.compare.outputs.diff_found }}
+          CHANGED_FILES: ${{ steps.compare.outputs.changed_files }}
+          TEAMS_ALERTS_WEBHOOK_URL: ${{ secrets.TEAMS_ALERTS_WEBHOOK_URL }}
+          TEAMS_NOTIFICATIONS_WEBHOOK_URL: ${{ secrets.TEAMS_NOTIFICATIONS_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "${DIFF_FOUND:-}" = "1" ]; then
+            webhook_url="$TEAMS_ALERTS_WEBHOOK_URL"
+            webhook_name="Alerts"
+            card_title="🚦 Azure Traffic Manager Probes"
+            card_status="Feed Changes Detected"
+            card_message="Differences were found between the generated Azure Traffic Manager probe feeds and the files currently stored in the repository. Please review the GitHub Actions run diff output."
+          elif [ "${DIFF_FOUND:-}" = "0" ]; then
+            webhook_url="$TEAMS_NOTIFICATIONS_WEBHOOK_URL"
+            webhook_name="Notifications"
+            card_title="🚦 Azure Traffic Manager Probes"
+            card_status="No Feed Changes"
+            card_message="Generated Azure Traffic Manager probe feeds match the current repository files."
+          else
+            webhook_url="$TEAMS_ALERTS_WEBHOOK_URL"
+            webhook_name="Alerts"
+            card_title="🚦 Azure Traffic Manager Probes"
+            card_status="Feed Check Failed"
+            card_message="The workflow did not complete the feed comparison step successfully. Please review the GitHub Actions run logs."
+            CHANGED_FILES="Unknown"
+          fi
+
+          if [ -z "${webhook_url:-}" ]; then
+            echo "::error::Teams $webhook_name webhook URL secret is missing or empty."
+            exit 1
+          fi
+
+          export card_title
+          export card_status
+          export card_message
+          export run_url
+          export CHANGED_FILES
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "type": "message",
+              "attachments": [
+                  {
+                      "contentType": "application/vnd.microsoft.card.adaptive",
+                      "content": {
+                          "type": "AdaptiveCard",
+                          "version": "1.2",
+                          "body": [
+                              {
+                                  "type": "TextBlock",
+                                  "text": os.environ["card_title"],
+                                  "weight": "Bolder",
+                                  "size": "Medium",
+                              },
+                              {
+                                  "type": "TextBlock",
+                                  "text": os.environ["card_status"],
+                                  "weight": "Bolder",
+                                  "spacing": "Medium",
+                              },
+                              {
+                                  "type": "FactSet",
+                                  "facts": [
+                                      {
+                                          "title": "Repository",
+                                          "value": os.environ["GITHUB_REPOSITORY"],
+                                      },
+                                      {
+                                          "title": "Branch",
+                                          "value": os.environ["GITHUB_REF_NAME"],
+                                      },
+                                      {
+                                          "title": "Run",
+                                          "value": os.environ["GITHUB_RUN_NUMBER"],
+                                      },
+                                      {
+                                          "title": "Trigger",
+                                          "value": os.environ["GITHUB_EVENT_NAME"],
+                                      },
+                                      {
+                                          "title": "Changed files",
+                                          "value": os.environ.get("CHANGED_FILES", "Unknown"),
+                                      },
+                                  ],
+                              },
+                              {
+                                  "type": "TextBlock",
+                                  "text": os.environ["card_message"],
+                                  "wrap": True,
+                              },
+                          ],
+                          "actions": [
+                              {
+                                  "type": "Action.OpenUrl",
+                                  "title": "Open GitHub Actions run",
+                                  "url": os.environ["run_url"],
+                              }
+                          ],
+                      },
+                  }
+              ],
+          }
+
+          Path("teams-payload.json").write_text(
+              json.dumps(payload, indent=2),
+              encoding="utf-8",
+          )
+          PY
+
+          echo "Sending Teams notification to $webhook_name webhook."
+
+          curl --fail-with-body \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data @teams-payload.json \
+            "$webhook_url"
